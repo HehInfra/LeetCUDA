@@ -2122,7 +2122,7 @@ __global__ void hgemm_mma_stages_tn_cute(T *Aptr, T *Bptr, T *Dptr, int m,
     //        K 被分为 BK/kMmaPK 个 perm-K slice
     //     随后按 AtomShape_MNK<2>（MMA_K_atom）做 zipped_divide
     //     每个 perm-K 含 kMmaEURepeatK 个 atom-K slice
-    //   → partition_A 选当前线程后，K-mode size = BK / kMmaPK
+    //   → partition_A 选当前线程后，K-mode size = BK / kMmaPK = 32 / 16 = 2
     // 本配置：kMmaPK=16（MMA_K_atom=16 × kMmaEURepeatK=1），BK=32 → num_k_steps=2
     int num_k_steps = size<2>(tCrA);
 
@@ -2171,19 +2171,64 @@ __global__ void hgemm_mma_stages_tn_cute(T *Aptr, T *Bptr, T *Dptr, int m,
 
   // Epilogue: D 寄存器 → shared memory → global memory。
   // 使用当前 A stage 作为 C scratchpad，避免为 epilogue 单独分配完整的 C shared memory。
+  // 这里是“复用 storage”，不是把 A Tensor 转换成 C Tensor：
+  //   sA 的逻辑 shape 是 (BM, BK, kStage)=(128,32,2)，而 sA(_,_,ismem_read)
+  //   只选出其中一个 A-stage 的 storage 起点；sC 随后以完全独立的 SmemLayoutC
+  //   解释这同一段地址。当前 wrapper 的固定配置下：
+  //     一个 A stage: 128 x 32 = 4096 个 half；
+  //     C scratchpad: 32 x 32 x 4 = 4096 个 half。
+  //   两者容量刚好相等，但 logical shape 和 layout 不是同一个：A 的 layout atom
+  //   是 8x32，C 的 layout atom 是 32x32，二者都含 Swizzle<3,3,3>，却不能把
+  //   C 数据再按 SmemLayoutA 读取。launch wrapper 的 static_assert 用当前配置
+  //   检查 C scratchpad 能放进一个 A pipe；此处只别名该单个 stage，不是整块双缓冲 sA。
+  //
+  // mainloop 已结束，不会再通过 sA 的 A/B load view 消费这个 pipe 的旧 A 数据。
+  // 从这一行开始，对这块地址的所有访问都通过 SmemLayoutC 派生的 sC 完成：R2S
+  // 用它写 C，S2G 也用它读 C。因此 C 的 swizzle/address mapping 在写和读两侧一致。
   auto sC = make_tensor(sA(_, _, ismem_read).data(), SmemLayoutC{});
 
   // R2S TiledCopy: 寄存器 → shared memory（使用 UniversalCopy 做类型转换）
+  // R2SCopyAtomC = Copy_Atom<UniversalCopy<int>, T>; 以 32-bit 粒度搬运 T 数据
   auto r2s_tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
   auto r2s_thr_copy_c = r2s_tiled_copy_c.get_slice(idx);
-  auto tCrC_r2s = r2s_thr_copy_c.retile_S(tCrD);    // (CPY, CPY_M, CPY_N)
-  auto tCsC_r2s = r2s_thr_copy_c.partition_D(sC);   // (CPY, _1, _1, pipe)
+  // tCrD 是 TiledMMA 产生的 accumulator fragment，逻辑 shape 为
+  // (MMA, MMA_M, MMA_N)。它的寄存器元素已经就位，但该 layout 是为 MMA
+  // accumulator 服务的，并不直接按 R2S copy atom 的 source-value 顺序表达。
+  //
+  // retile_S 中的 S 指“这个 TiledCopy 的 source side”，不是 shared memory。
+  // 它基于 r2s_tiled_copy_c 的 reference layout 创建一个共享 tCrD.data() 的
+  // zero-copy layout view，将逻辑坐标表示为 (CPY, CPY_M, CPY_N)。这一步不读取
+  // 或写入寄存器/共享内存，不进行 dtype conversion，也不交换 lane 间数据；真正的
+  // R2S 数据搬运发生在下面的 cute::copy(r2s_tiled_copy_c, ..., tCsC_r2s(...))。
+  // 可将它与主循环的 s2r_thr_copy_a.retile_D(tCrA) 对照：二者都是为了让已有
+  // fragment 的 per-thread value ordering 匹配某个 TiledCopy 的 source/destination
+  // 角色，而不是另一次 memory transfer。
+  // tCrD: (MMA, MMA_M, MMA_N) -> retile -> tCrC_r2s: (CPY, CPY_M, CPY_N)
+  auto tCrC_r2s = r2s_thr_copy_c.retile_S(tCrD); // (CPY, CPY_M, CPY_N)
+  // get_slice(idx) 已固定 CTA 内当前 logical copy thread；partition_D 再按
+  // R2S TiledCopy 的 destination mapping 切分 sC。推导链：
+  //   MMA_P_T = Tile<kMmaPM, kMmaPN, kMmaPK> = Tile<32, 32, 16>
+  //     → TiledMMA::tile_size<0>(mma) = 32, tile_size<1>(mma) = 32
+  //     → make_tiled_copy_C 的 tiler = (32, 32)
+  //     → SmemLayoutC 的逻辑 M×N = (kMmaPM, kMmaPN) = (32, 32) 恰好等于该 tiler
+  //     → partition_D: zipped_divide(sC, tiler=(32,32)) 后 M/N 维无 remainder
+  //     → 结果 shape 的 M/N remainder = _1, _1
+  // 最后一维 pipe=4 来自 SmemLayoutC 的第三维 kSmemLayoutCBatch，而不是
+  // “thread-level tensor 自动只剩 CPY”这一条规则。_1 表示该逻辑 mode 的 extent
+  // 是 1，并非该 mode 被删除或 C tile 没有 M/N 覆盖。
+  auto tCsC_r2s = r2s_thr_copy_c.partition_D(sC); // (CPY, _1, _1, pipe)
 
   // S2G TiledCopy: shared memory → global memory（128-bit store）
+  // S2GCopyAtomC(Copy_Atom<UniversalCopy<cute::uint128_t>, T>) -> S2GCopyC
   S2GCopyC s2g_tiled_copy_c;
-  auto s2g_thr_copy_c = s2g_tiled_copy_c.get_thread_slice(idx);
-  auto tCsC_s2g = s2g_thr_copy_c.partition_S(sC);    // (CPY, _1, _1, pipe)
-  auto tCgC_s2g = s2g_thr_copy_c.partition_D(gD);    // (CPY, CPY_M, CPY_N)
+  auto s2g_thr_copy_c = s2g_tiled_copy_c.get_slice(idx);
+  // tCsC_s2g 与 tCsC_r2s 都从同一个 sC 产生，因而保留相同的 pipe=4；前者是
+  // S2G source mapping，后者是 R2S destination mapping。tCgC_s2g 则面向完整
+  // gD=(BM,BN)=(128,256)，相对于 S2G copy tiler 仍有非平凡的 M/N repetition，
+  // 所以它保留 CPY_M、CPY_N。这里的 CPY/CPY_M/CPY_N 都是编译期 copy-partition
+  // 的逻辑 mode，不应直接理解为固定的 lane 数、warp 数或物理连续维度。
+  auto tCsC_s2g = s2g_thr_copy_c.partition_S(sC); // (CPY, _1, _1, pipe)
+  auto tCgC_s2g = s2g_thr_copy_c.partition_D(gD); // (CPY, CPY_M, CPY_N)
 
   // group_modes<B,E> 将 layout 的半开区间 [B,E) 组合成一个嵌套 mode：
   //   group_modes<1,3>(Tensor(CPY, CPY_M, CPY_N))
@@ -2192,6 +2237,11 @@ __global__ void hgemm_mma_stages_tn_cute(T *Aptr, T *Bptr, T *Dptr, int m,
   // 第二个 mode 仍然保存原来 CPY_M/CPY_N 的层次关系，只是现在可以用一个坐标
   // i+j 访问这个组合 mode；因此这里的 group_modes 更准确地说是“合并 mode”，
   // 而不是把底层数据拷贝或无条件 flatten 成普通一维数组。
+  // 从 type/shape 结构看，结果确实是 Tensor(CPY, (CPY_M, CPY_N))；但 grouped
+  // mode 的 cardinality 是两个子 mode 的乘积，因此 size<1>(...) 可作为一个标量
+  // 范围遍历其全部 logical coordinate。于是 (_, i+j) 中的 i+j 是该 nested mode
+  // 的线性 logical coordinate，不是在 C++ 中对二维 tuple 做加法，更不是 raw
+  // pointer offset；最终物理地址仍由各自 Tensor 的 grouped layout 计算。
   //
   // 这里为什么要对 tCrC_r2s 和 tCgC_s2g 同时 group？
   //   - tCrC_r2s: 每个线程持有的寄存器 C fragment，原始形状为 (CPY, CPY_M, CPY_N)；
@@ -2204,29 +2254,130 @@ __global__ void hgemm_mma_stages_tn_cute(T *Aptr, T *Bptr, T *Dptr, int m,
   // 每一轮可以复用的 C shared-memory pipeline 深度。外层 i 在合并后的 C 元素空间中
   // 按 step 前进，内层 j 选择当前 pipeline slot：寄存器先写入 sC(_,0,0,j)，
   // 再从同一个 slot 写回 global memory。
+  // 当前 kSmemLayoutCBatch=4，因此 step=4。代码未对 i+j 做尾部 predication，
+  // 这个循环依赖当前静态 layout 中 grouped extent 能被 pipe depth 整除；不应将
+  // “每轮正好处理 4 个 fragment”误认为任意 tile/copy 配置都自动成立的通用规则。
   auto tCgC_s2gx = group_modes<1, 3>(tCgC_s2g);
   auto tCrC_r2sx = group_modes<1, 3>(tCrC_r2s);
 
   int step = size<3>(tCsC_r2s); // C scratchpad 的 pipe 数（由 kSmemLayoutCBatch=4 指定）
+  // 双层循环的语义（注意 step 与 CPY_N 无关）：
+  //   group_modes<1,3> 之后，tCrC_r2sx 的 shape 为 (CPY, (CPY_M, CPY_N))。
+  //   size<1>(tCrC_r2sx) = CPY_M * CPY_N，即该线程需处理的 C fragment 总数。
+  //   外循环以 step=4 为步长，内循环 j=0..3 每次处理 1 个 fragment，将其写入
+  //   第 j 号 C scratchpad pipe slot，再读出写回 global。
+  //
+  //   这里 step=4 是 scratchpad pipeline 深度，不是 CPY_N。CPY_N 的值取决于
+  //   TiledMMA 的 C-layout 如何将 (128,256) 的 gD tile 分配到 128 个线程上，
+  //   通常 ≠ 4。循环之所以成立，是因为 grouped mode 用线性坐标 i+j 遍历整个
+  //   CPY_M * CPY_N 的扁平空间——它不再区分 M 和 N 方向，也不要求 CPY_N == step。
+  //   唯一前提是 CPY_M * CPY_N 能被 step 整除（当前静态 layout 编译期保证）。
+  //
+  //   第 j 号 pipe slot 在 sC 上的物理地址由 R2S partition_D / S2G partition_S
+  //   各自推导；因为二者都从同一个 sC（SmemLayoutC）出发，pipe mode 保持一致，
+  //   写入和读取命中同一段 shared memory。
 #pragma unroll
   for (int i = 0; i < size<1>(tCrC_r2sx); i += step) {
-    // 每轮处理 step 个合并后的 C fragment，i 是合并 mode 的起始坐标。
-    // R→S: 寄存器写回 shared memory 的第 j 个 pipe slot。
+    // 每轮处理 step 个 fragment，内层 j 选 pipe slot。
 #pragma unroll
     for (int j = 0; j < step; ++j) {
+      // 这两行是 R2R staging：make_tensor_like<T> 分配当前线程私有、拥有 storage
+      // 的 register Tensor；普通 cute::copy 将 accumulator fragment materialize
+      // 成输出元素类型 T 的临时 payload。
+      //
+      // cute::copy（无 copy-atom 的普通版）内部按元素做
+      //   dst(i) = static_cast<T>(static_cast<SrcType>(src(i)))
+      // 因此当 accumulator 与 T 类型不同时，它自动完成 dtype 转换；当二者相同
+      // （如本 kernel 的 f16 accumulator + T=half），cast 退化为 no-op。
+      //
+      // 即使类型一致，t 还有一个不可省略的作用：layout 归一化。
+      // tCrC_r2sx(_, i+j) 的 layout 是 retile_S → group_modes → slice 层层
+      // 叠加的 composed layout，而 make_tensor_like<T> + cute::copy 把它
+      // 物化到一个拥有简单 strides 的 owning register Tensor 中。后续
+      // r2s_tiled_copy_c 的 copy_unpack 需要按 copy-atom 的 val-layout
+      // 拆分 source 元素，简单 owning layout 比复杂的 composed layout 更容易
+      // 被编译器推导内联。上游同源实现将其概括为"cope with accumulator and
+      // output data type difference"，实际承担了类型适配和 layout 归一化两个职责。
+      //
+      // 这不是 retile_S 的一部分，也不是 warp shuffle：源/目的都在当前线程的
+      // register 中，代码没有显式 __shfl_sync。不能仅根据这段 C++ 断言最终 SASS
+      // 绝不会含 shuffle；但语义上的跨线程 regrouping 不由此 R2R copy 承担，而是
+      // 由随后的 R2S -> shared memory -> S2G 路径完成。若特定 accumulator/output
+      // type 与 R2S copy-atom contract 已直接兼容，可以设计直接 R2S 的变体；本例
+      // 保持同源实现的通用 staging 写法。
       auto t = make_tensor_like<T>(tCrC_r2sx(_, i + j));
       cute::copy(tCrC_r2sx(_, i + j), t);
+      // R2S 的 copy atom 才在此处将 thread-local payload 写入 j 号 C scratchpad
+      // slot；SmemLayoutC 定义写入后的跨线程地址重组。
+      //
+      // cute::copy(r2s_tiled_copy_c, src, dst) 的调用链路：
+      //   r2s_tiled_copy_c 是 TiledCopy，但继承自 Copy_Atom<UniversalCopy<int>,T>
+      //   → 匹配 copy(Copy_Atom<...> const&, src, dst) 重载 [copy.hpp:~L190]
+      //   → src(t) 与 dst(tCsC_r2s(_,0,0,j)) 都是 rank-1 → 直接 copy_atom.call
+      //   → copy_atom.call 内部：若 size(src)==NumValSrc（atom 编译期 val-count），
+      //     走 copy_unpack；否则递归剥 mode，最终都落到 UniversalCopy<int>::copy
+      //     → 硬件层面就是逐 uint32_t 的 register-to-smem store [arch/copy.hpp:~L46]
+      //
+      //   这里没有任何运行时"查找表"：t 的第 i 个元素之所以对应 dst 的第 i 个
+      //   shared memory offset，是因为 pre-partition 阶段已经把映射烧进 layout 了：
+      //     - t 的 layout 来自 retile_S → group_modes → slice → make_tensor_like
+      //       → 元素顺序已按 R2S atom 的 source-side value ordering 排好
+      //     - tCsC_r2s 的 layout 来自 r2s_thr_copy_c.partition_D(sC)
+      //       → TiledCopy::tidfrg_D 用 LayoutCopy_TV + Tiler_MN + ValLayoutDst
+      //         计算了当前线程每个 val 在 smem 中的物理 offset
+      //   两者共享同一个 copy atom 的 ValLayoutSrc/ValLayoutDst 定义，
+      //   因此逐元素 copy 天然把正确的数据写到了正确的地址。
       cute::copy(r2s_tiled_copy_c, t, tCsC_r2s(_, 0, 0, j));
     }
+    // 这是 CTA 范围的 rendezvous：所有线程完成当前批 R2S 写入后，S2G 才能从
+    // sC 的重组布局读取完整数据。它承担了手写版中显式跨 lane 拼接所需的协作边界。
     __syncthreads();
 
     // S→G: 从同一个 pipe slot 读回 global memory，保持源/目的坐标一一对应。
 #pragma unroll
     for (int j = 0; j < step; ++j) {
+      // S2GCopyC 的 atom 为 UniversalCopy<uint128_t>：与 R2S 的 UniversalCopy<int>
+      // （32-bit）不同，它一次搬运 128-bit（8 个 half），映射为一条 wide store
+      // （如 st.global.v4.f32 或 st.global.b128）。
+      //
+      // cute::copy(s2g_tiled_copy_c, src, dst) 的调用链路：
+      //   s2g_tiled_copy_c 是 TiledCopy，继承自 Copy_Atom<UniversalCopy<uint128_t>,T>
+      //   → 匹配 copy(Copy_Atom<...> const&, src, dst) 重载 [copy.hpp:~L190]
+      //   → src=tCsC_s2g(_,0,0,j) 与 dst=tCgC_s2gx(_,i+j) 都是 rank-1
+      //   → 直接 copy_atom.call(src, dst)
+      //   → copy_atom.call 内部：size(src)==NumValSrc → copy_unpack
+      //     → 逐 128-bit chunk 调用 UniversalCopy<uint128_t>::copy
+      //     → 硬件层面就是 shared-memory-to-global wide store [arch/copy.hpp:~L46]
+      //
+      // S2G 的 pre-partition 与 R2S 对称，但 source/destination 角色互换：
+      //   - tCsC_s2g 来自 s2g_thr_copy_c.partition_S(sC)：TiledCopy::tidfrg_S
+      //     用 LayoutCopy_TV + Tiler_MN + ValLayoutSrc 计算了当前线程每个 val
+      //     在 sC（shared memory）中的物理 offset。
+      //     S2GCopyC 的 tiler = product(ThrLayout{32,4}, ValLayout{1,8})
+      //                        = (32×1, 4×8) = (32, 32) — 恰好与 R2S tiler 相同，
+      //     因此 tCsC_s2g 也是 (CPY, _1, _1, pipe)，_1,_1 来自 sC=(32,32,4) 无
+      //     M/N remainder。
+      //   - tCgC_s2gx(_, i+j) 来自 s2g_thr_copy_c.partition_D(gD) → group_modes
+      //     → slice。gD=(128,256) 相对于 tiler (32,32) 有 4×8 个 tile repetition，
+      //     因此 tCgC_s2g 为 (CPY, CPY_M, CPY_N)，group_modes<1,3> 合并 M/N
+      //     repetition 后得到 (CPY, (CPY_M,CPY_N))，再用线性坐标 i+j 切片。
+      //   两者共享同一个 copy atom 的 ValLayoutSrc/ValLayoutDst 定义，
+      //   因此逐 chunk copy 天然从正确的 smem 地址读到正确的 gmem 地址。
       cute::copy(s2g_tiled_copy_c, tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i + j));
     }
+    // 所有线程都完成当前 pipe slots 的 S2G 读取后，下一轮 R2S 才能覆盖这 4 个
+    // scratchpad slots，避免一部分线程仍在读取旧数据时被其他线程提前重写。
     __syncthreads();
   }
+
+  // 与 hgemm_mma_stages_tn 的手写 epilogue 对照：手写版必须显式处理 MMA fragment
+  // 的物理分布，使用 RC0/RC1 暂存，再用 __shfl_sync 从同一 warp 的相邻 lane 收齐
+  // 8 个 half，并由 lane_id % 4 == 0 的线程做 float4 (128-bit) global store。
+  // CuTe 版没有把这些 lane 映射写死在 kernel 源码中：retile_S 表达 accumulator
+  // fragment 与 R2S copy 的对应，R2S/sC/S2G 通过 shared-memory scratchpad 完成
+  // CTA 范围的数据重组，S2GCopyC 以 uint128_t 表达 wide store。两者的共同目标都是
+  // 将分散在计算线程寄存器中的 C fragment 变为适合连续 global-memory 写回的布局；
+  // 区别是手写版直接编排 shuffle/store，CuTe 版将映射交给 TiledMMA/TiledCopy 类型推导。
 }
 
 // =============================================================================
@@ -2236,6 +2387,8 @@ __global__ void hgemm_mma_stages_tn_cute(T *Aptr, T *Bptr, T *Dptr, int m,
 // 所有的 MMA atom、TiledCopy、SmemLayout、Swizzle 都是 **编译期类型**，
 // kernel 接收这些类型的实例（通常为空 struct），在编译期完成全部映射推导。
 //
+// 以下每个类型定义后面都标注了它在 kernel body 中的对应变量/用法，形成 1:1 对照。
+//
 // 面试常问：「CuTe 为什么比手写 PTX 简洁？」
 // 答: 手写需要:
 //   1) 手动计算每线程的 smem 地址偏移
@@ -2244,48 +2397,34 @@ __global__ void hgemm_mma_stages_tn_cute(T *Aptr, T *Bptr, T *Dptr, int m,
 //   4) 手动做 epilogue 的 warp shuffle 编排
 // CuTe 的 partition + copy + gemm 通过 TiledCopy/TiledMMA 的类型信息
 // 在编译期自动完成上述全部推导，生成与手写等价的 PTX 指令序列。
-//
-// 模板参数推导链（面试速记）：
-//   SM80_16x8x16_F16F16F16F16_TN  ← MMA 指令 atom
-//     → MMA_Atom<MMA_Traits<mma_op>>
-//     → make_tiled_mma(mma_atom, EURepeat{2,2,1}, ValTile{32,32,16})
-//     → TiledMMA (128 threads, 4 warps × 2×2 slices)
-//
-//   SM80_CP_ASYNC_CACHEGLOBAL<uint128_t> ← G→S copy atom
-//     → Copy_Atom<Copy_Traits<g2s_copy_op>, T>
-//     → make_tiled_copy(copy_atom, ThrLayout{32,4}, ValLayout{1,8})
-//     → G2SCopy: 32×4=128 threads, each copies 1×8=8 halfs = 128 bits
-//
-//   Swizzle<3,3,3> + Atom{8,BK} → composition → tile_to_shape{BM,BK,kStage}
-//     → SmemLayoutA/B: 将 base layout 产生的线性元素 offset 送入 swizzle，
-//       使 shared-memory 中的物理地址按 XOR 规则重排；它不是改变 Tensor 的逻辑坐标，
-//       而是改变逻辑坐标到 smem offset 的映射。
-//
-//   SM75_U32x4_LDSM_N ← S→R copy atom (ldmatrix 的 CuTe 封装)
-//     → Copy_Atom<Copy_Traits<s2r_copy_op>, T>
-//
-//   UniversalCopy<uint128_t> ← S→G copy atom (128-bit store)
-//     → make_tiled_copy(copy_atom, ThrLayout{32,4}, ValLayout{1,8})
-//
-// ★ Tile 尺寸速查:
-//   BM=128: A/gmem 的 M 方向 block tile；由 launch wrapper 的目标 shape 指定。
-//   BN=256: B/gmem 的 N 方向 block tile；独立于 TiledMMA 的 32×32 逻辑 MMA tile。
-//   BK=32:  A/B 的 K 方向 gmem/smem tile；包含两个 MMA_K=16 的 K slice。
-//   kStage=2: K tile 的双缓冲 pipeline；另有 kSmemLayoutCBatch=4 个 C epilogue pipe slots。
 // =============================================================================
 template <typename T, const int Stages = 2>
 void launch_hgemm_mma_stages_tn_cute(T *a, T *b, T *c, int M, int N, int K) {
   using namespace cute;
 
+  // ── Tile 尺寸（kernel 模板参数 BM/BN/BK/kStage 的值）──
+  //
+  // kernel 用法对照：
+  //   BM=128:   local_tile(A, make_tile(Int<BM>{}, Int<BK>{}), ...) → gA=(BM,BK,num_k_tiles)
+  //             local_tile(D, make_tile(Int<BM>{}, Int<BN>{}), ...) → gD=(BM,BN)
+  //   BN=256:   local_tile(B, make_tile(Int<BN>{}, Int<BK>{}), ...) → gB=(BN,BK,num_k_tiles)
+  //             local_tile(D, ...) → gD 的列方向
+  //   BK=32:    num_k_tiles = k / BK; 每个 BK tile 内 num_k_steps = BK/kMmaPK = 2 个 MMA_K slice
+  //   kStage=2: sA/sB 的第三维 = (BM,BK,kStage)；cp_async_wait<kStage-2>() 流水线同步
+  //   kSmemLayoutCBatch=4: step = size<3>(tCsC_r2s) → C scratchpad pipe 深度 = 4
   auto BM = Int<128>{};
   auto BN = Int<256>{};
   auto BK = Int<32>{};
   auto KStage = Int<Stages>{};
-  auto kSmemLayoutCBatch = Int<4>{}; // C smem pipeline depth
+  auto kSmemLayoutCBatch = Int<4>{};
 
-  // SmemLayout: 先构造 8×BK 的 row-major base layout，再组合 Swizzle<3,3,3>。
+  // ── SmemLayoutA / SmemLayoutB ──
+  // kernel 用法: 
+  // auto sA = make_tensor(make_smem_ptr(Ashm), SmemLayoutA{}); // (BM, BK, kStage)
+  // auto sB = make_tensor(make_smem_ptr(Bshm), SmemLayoutB{}); // (BN, BK, kStage)
+  // SmemLayout 由三部分组成：Swizzle<3,3,3> + atom layout(8×BK) + tile_to_shape 扩展到完整 tile+stage。
+  //
   // 对当前 base layout shape=(8,32), stride=(32,1), T=half 的例子：
-  //   - offset 的有效范围是 0..255；
   //   - M=3：连续 2^3=8 个 half 组成一个基本元素，即 16 bytes；
   //   - S=3：连续 2^3=8 个基本元素组成一行，即 128 bytes；
   //   - B=3：共有 2^3=8 行。
@@ -2296,8 +2435,6 @@ void launch_hgemm_mma_stages_tn_cute(T *a, T *b, T *c, int M, int N, int K) {
   // 地址位 [6:8] XOR 到 [3:5]，地址位 [0:2] 不参与置换。
   // composition(Swizzle, base_layout) 的语义是 R(c) = Swizzle(base_layout(c))：
   // 逻辑坐标仍由 base_layout 给出，只有最终的 shared-memory offset 被重排。
-  // 对 ldmatrix 的访问模式，这种列置换可将不同逻辑行在同一列的访问打散到不同 bank，
-  // 降低 bank conflict；它不是 grid/block 的 block swizzle。
   // tile_to_shape: 通过 blocked product 重复这个带 swizzle 的 block layout，
   // 使结果 shape 匹配 BM×BK×kStage；默认按目标 shape 的 mode order 重复各维。
   using SmemLayoutAtom = decltype(composition(
@@ -2309,7 +2446,20 @@ void launch_hgemm_mma_stages_tn_cute(T *a, T *b, T *c, int M, int N, int K) {
   using SmemLayoutB = decltype(tile_to_shape(
       SmemLayoutAtom{}, make_shape(Int<BN>{}, Int<BK>{}, Int<KStage>{})));
 
-  // MMA: SM80_16x8x16_F16F16F16F16_TN。
+  // ── MMA (TiledMMA) ──
+  // kernel 用法: 
+  // TiledMMA tiled_mma;
+  // auto thr_mma = tiled_mma.get_slice(threadIdx.x);  // 每线程的 MMA slice
+  // auto tCrA = thr_mma.partition_fragment_A(gA(_,_,0)); // (MMA, MMA_M, MMA_K)
+  // auto tCrB = thr_mma.partition_fragment_B(gB(_,_,0)); // (MMA, MMA_N, MMA_K)
+  // auto tCrD = thr_mma.partition_fragment_C(gD);        // (MMA, MMA_M, MMA_N)
+  // cute::gemm(tiled_mma, tCrD, tCrA(_,_,k_step), tCrB(_,_,k_step), tCrD);
+  // MMA 还决定 S2R/R2S copy 的 tiler：make_tiled_copy_A/B/C 都依赖 tiled_mma 的
+  // tile_size<0/1>(mma) = (32,32) 来推导线程→数据映射。
+  //
+  // 推导链: SM80_16x8x16_F16F16F16F16_TN → MMA_Atom 
+  //   → make_tiled_mma(atom, EURepeat{2,2,1}, ValTile{32,32,16})
+  //   → TiledMMA: 128 threads = 4 warps × (2×2 EU slices)，逻辑 MMA tile = 32×32×16
   // TN = A row-major, B col-major；因此传给本 kernel 的 B 指针实际指向
   // B^T[N,K] 的 row-major 存储（等价于 GEMM 语义中的 B[K,N] col-major）。
   using mma_op = SM80_16x8x16_F16F16F16F16_TN;
@@ -2323,13 +2473,20 @@ void launch_hgemm_mma_stages_tn_cute(T *a, T *b, T *c, int M, int N, int K) {
   static constexpr int kMmaPM = 1 * kMmaEURepeatM * get<0>(mma_atom_shape{}); // 32
   static constexpr int kMmaPN = 2 * kMmaEURepeatN * get<1>(mma_atom_shape{}); // 32
   static constexpr int kMmaPK = 1 * kMmaEURepeatK * get<2>(mma_atom_shape{}); // 16
+  // kMmaPK=16 → kernel 中 num_k_steps = size<2>(tCrA) = BK/kMmaPK = 32/16 = 2
 
   using MMA_EU_RepeatT = decltype(make_layout(make_shape(
       Int<kMmaEURepeatM>{}, Int<kMmaEURepeatN>{}, Int<kMmaEURepeatK>{})));
   using MMA_P_T = Tile<Int<kMmaPM>, Int<kMmaPN>, Int<kMmaPK>>;
   using MMA = decltype(make_tiled_mma(mma_atom{}, MMA_EU_RepeatT{}, MMA_P_T{}));
 
-  // G2S Copy: 128-bit cp.async；32×4=128 个线程，每线程搬运 1×8 个 half（16 bytes）。
+  // ── G2SCopyA / G2SCopyB ──
+  // kernel 用法: 
+  // G2SCopyA g2s_tiled_copy_a; G2SCopyB g2s_tiled_copy_b;
+  // cute::copy(g2s_tiled_copy_a, tAgA_copy(_,_,_,istage), tAsA_copy(_,_,_,istage));
+  // cute::copy(g2s_tiled_copy_b, tBgB_copy(_,_,_,istage), tBsB_copy(_,_,_,istage));
+  // G→S: 128-bit cp.async。ThrLayout{32,4} × ValLayout{1,8}:
+  //   128 个线程，每线程搬运 1×8=8 个 half = 128 bits。
   using g2s_copy_op = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
   using g2s_copy_traits = Copy_Traits<g2s_copy_op>;
   using g2s_copy_atom = Copy_Atom<g2s_copy_traits, T>;
@@ -2340,17 +2497,29 @@ void launch_hgemm_mma_stages_tn_cute(T *a, T *b, T *c, int M, int N, int K) {
       make_layout(make_shape(Int<1>{}, Int<8>{}))));
   using G2SCopyB = G2SCopyA;
 
-  // S2R Copy: ldmatrix (SM75_U32x4_LDSM_N)，由 make_tiled_copy_A/B 根据 TiledMMA
-  // 自动生成与 MMA fragment 对齐的 shared→register 映射。
+  // ── S2RCopyAtomA / S2RCopyAtomB ──
+  // kernel 用法: 
+  // auto s2r_tiled_copy_a = make_tiled_copy_A(S2RCopyAtomA{}, tiled_mma);
+  // auto s2r_tiled_copy_b = make_tiled_copy_B(S2RCopyAtomB{}, tiled_mma);
+  // cute::copy(s2r_tiled_copy_a, tAsA(_,_,k_step_next,ismem_read), tCrA_view(_,_,k_step_next));
+  // cute::copy(s2r_tiled_copy_b, tBsB(_,_,k_step_next,ismem_read), tCrB_view(_,_,k_step_next));
+  // S→R: ldmatrix (SM75_U32x4_LDSM_N)。make_tiled_copy_A/B 根据 TiledMMA 自动推导
+  // 与 MMA fragment 对齐的 shared→register 映射，无需手动指定 ThrLayout/ValLayout。
   using s2r_copy_op = SM75_U32x4_LDSM_N;
   using s2r_copy_traits = Copy_Traits<s2r_copy_op>;
   using s2r_copy_atom = Copy_Atom<s2r_copy_traits, T>;
   using S2RCopyAtomA = s2r_copy_atom;
   using S2RCopyAtomB = s2r_copy_atom;
 
-  // Epilogue smem layout for C: 对 32×32 base layout 应用同一地址位 XOR 规则，
-  // 再扩展为 4 个 C scratchpad pipe slots；这 4 个 slots 属于 epilogue 的临时缓冲，
-  // 不等同于主循环的 kStage K-tile pipeline，也不改变 C 的逻辑坐标。
+  // ── SmemLayoutC ──
+  // kernel 用法: 
+  // auto sC = make_tensor(sA(_,_,ismem_read).data(), SmemLayoutC{});
+  // 复用当前 A stage 的空间作为 C scratchpad
+  // sC shape = (kMmaPM, kMmaPN, kSmemLayoutCBatch) = (32, 32, 4)
+  // pipe 数 4 由 kSmemLayoutCBatch 指定 → step = size<3>(tCsC_r2s) = 4
+  // 与 A/B 相同的 Swizzle<3,3,3> 规则，但 base layout 是 32×32（MMA tile 大小），
+  // 再扩展为 4 个 epilogue scratchpad pipe slots。这 4 个 slots 不等同于主循环
+  // 的 kStage K-tile pipeline。
   using SmemLayoutAtomC = decltype(composition(
       Swizzle<3, 3, 3>{},
       make_layout(make_shape(Int<kMmaPM>{}, Int<kMmaPN>{}),
@@ -2359,10 +2528,22 @@ void launch_hgemm_mma_stages_tn_cute(T *a, T *b, T *c, int M, int N, int K) {
       SmemLayoutAtomC{},
       make_shape(Int<kMmaPM>{}, Int<kMmaPN>{}, Int<kSmemLayoutCBatch>{})));
 
-  // R2S Copy: 寄存器 → shared memory；UniversalCopy<int> 以 32-bit 粒度搬运 T 数据。
+  // ── R2SCopyAtomC ──
+  // kernel 用法: 
+  // auto r2s_tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
+  // cute::copy(r2s_tiled_copy_c, t, tCsC_r2s(_, 0, 0, j));
+  // R→S: UniversalCopy<int> 以 32-bit 粒度将寄存器 payload 写入 C scratchpad。
+  // make_tiled_copy_C 从 TiledMMA 的 tile_size<0/1>(mma)=(32,32) 推导 tiler，
+  // 因此 R2S copy 的 tiler = (32,32)，与 SmemLayoutC 的 (32,32) 恰好匹配。
   using R2SCopyAtomC = Copy_Atom<UniversalCopy<int>, T>;
 
-  // S2G Copy: shared memory → global；UniversalCopy<uint128_t> 以 128-bit 粒度 store。
+  // ── S2GCopyC ──
+  // kernel 用法: 
+  // S2GCopyC s2g_tiled_copy_c;
+  // cute::copy(s2g_tiled_copy_c, tCsC_s2g(_, 0, 0, j), tCgC_s2gx(_, i+j));
+  // S→G: UniversalCopy<uint128_t> 以 128-bit 粒度做 shared→global wide store。
+  // ThrLayout{32,4} × ValLayout{1,8} → tiler = product((32,4),(1,8)) = (32,32)，
+  // 与 R2S tiler 相同，因此 partition_S(sC) 得到的 pipe 维度一致。
   using S2GCopyAtomC = Copy_Atom<UniversalCopy<cute::uint128_t>, T>;
   using S2GCopyC = decltype(make_tiled_copy(
       S2GCopyAtomC{},
@@ -2370,19 +2551,32 @@ void launch_hgemm_mma_stages_tn_cute(T *a, T *b, T *c, int M, int N, int K) {
                   make_stride(Int<4>{}, Int<1>{})),
       make_layout(make_shape(Int<1>{}, Int<8>{}))));
 
-  // Grid/Block 配置：每个 CTA 覆盖 gmem/smem 的 BM×BN 输出 tile。
-  // 由于 kernel 没有边界 tile 的逐元素保护，当前 wrapper 的输入应满足
+  // ── Grid/Block 配置 ──
+  // kernel 用法: 
+  // int idx = threadIdx.x;         // 0..127
+  // int ix = blockIdx.x;           // N 方向 CTA 坐标
+  // int iy = blockIdx.y;           // M 方向 CTA 坐标
+  // if (iy * BM >= m || ix * BN >= n) return;  // CTA 级边界保护
+  // 由于 kernel 没有 tile 内的逐元素 predication，调用方需保证
   // M % BM == 0、N % BN == 0、K % BK == 0。
   int BX = (N + BN - 1) / BN;
   int BY = (M + BM - 1) / BM;
-  dim3 block(size(MMA{}));   // 128 threads
+  dim3 block(size(MMA{}));   // 128 threads (= size(TiledMMA))
   dim3 grid(BX, BY);
 
-  // Smem 大小：A/B 的所有 K-stage tile；C epilogue 复用一个 A stage 的空间。
+  // ── Dynamic Shared Memory 大小 ──
+  // kernel 用法: 
+  // extern __shared__ T shm_data[];
+  // T *Ashm = shm_data;
+  // T *Bshm = shm_data + cute::cosize(SmemLayoutA{});
+  // cosize(SmemLayoutA) = BM*BK*kStage = 128*32*2 = 8192 个 T
+  // cosize(SmemLayoutB) = BN*BK*kStage = 256*32*2 = 16384 个 T
+  // 合计 A+B = 24576 个 T；C epilogue 复用一个 A stage（128*32 = 4096 个 T）。
+  // static_assert 保证 C scratchpad (kMmaPM*kMmaPN*kSmemLayoutCBatch = 32*32*4 = 4096)
+  // 能放进一个 A stage (128*32 = 4096)。
   static constexpr int shm_size_AB =
       cute::cosize(SmemLayoutA{}) + cute::cosize(SmemLayoutB{});
   static constexpr int shm_size_C = cute::cosize(SmemLayoutC{});
-  // C scratchpad 的 cosize 必须不超过一个 A stage 的容量，才能安全复用 A stage。
   static_assert(size<0>(SmemLayoutA{}) * size<1>(SmemLayoutA{}) >= size(SmemLayoutC{}),
                 "C shared memory must fit within one A pipe");
   static constexpr int kShmSize =
